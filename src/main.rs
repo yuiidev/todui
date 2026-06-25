@@ -41,6 +41,7 @@ const TODO_INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
 const LLM_API_KEY_ENV: &str = "TODUI_LLM_API_KEY";
 const CHAT_BAR_OUTPUT_SCHEMA_FILE: &str = "schemas/chat-bar-todo.schema.json";
 const CHAT_BAR_ERROR_LOG_FILE: &str = "chat-bar-error.log";
+const APP_DIR_NAME: &str = "todui";
 const HIDE_COMPLETED_AFTER_DAYS: i64 = 14;
 const DEFAULT_TASK_CONTENT_WRAP_COLS: usize = 120;
 const MIN_TASK_CONTENT_WRAP_COLS: usize = 20;
@@ -48,6 +49,24 @@ const TASK_CONTENT_WRAP_COL_STEP: usize = 10;
 const DEFAULT_LLM_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_LLM_MODEL: &str = "gpt-5.5";
 const LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_SETTINGS_JSON: &str = include_str!("../settings.json");
+const DEFAULT_TODO_INSTRUCTIONS: &str = include_str!("../data/INSTRUCTIONS.md");
+const DEFAULT_CHAT_BAR_OUTPUT_SCHEMA_JSON: &str =
+    include_str!("../schemas/chat-bar-todo.schema.json");
+const BUNDLED_THEMES: [(&str, &str); 3] = [
+    (
+        "base16-onedark.tmTheme",
+        include_str!("../themes/base16-onedark.tmTheme"),
+    ),
+    (
+        "base16-black-metal-dark-funeral.tmTheme",
+        include_str!("../themes/base16-black-metal-dark-funeral.tmTheme"),
+    ),
+    (
+        "base16-black-metal-venom.tmTheme",
+        include_str!("../themes/base16-black-metal-venom.tmTheme"),
+    ),
+];
 const CHAT_BAR_JSON_HARNESS: &str = r#"You are the todui chat bar JSON harness.
 Convert the user's call, meeting, or conversation notes into one new todo draft.
 
@@ -60,9 +79,10 @@ Output contract:
 - Use null for "branch" or "due_at" when absent."#;
 
 fn main() -> Result<()> {
+    let paths = AppPaths::from_env()?;
+    paths.bootstrap()?;
     let mut terminal = init_terminal()?;
-    let app_result = App::new(PathBuf::from(DATA_DIR), PathBuf::from(SETTINGS_FILE))
-        .and_then(|app| run_app(&mut terminal, app));
+    let app_result = App::from_paths(paths).and_then(|app| run_app(&mut terminal, app));
     let restore_result = restore_terminal(&mut terminal);
 
     if let Err(error) = restore_result {
@@ -73,6 +93,124 @@ fn main() -> Result<()> {
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ConfigTarget {
+    Linux,
+    Macos,
+    Windows,
+    Unsupported,
+}
+
+#[cfg(target_os = "linux")]
+fn current_config_target() -> ConfigTarget {
+    ConfigTarget::Linux
+}
+
+#[cfg(target_os = "macos")]
+fn current_config_target() -> ConfigTarget {
+    ConfigTarget::Macos
+}
+
+#[cfg(target_os = "windows")]
+fn current_config_target() -> ConfigTarget {
+    ConfigTarget::Windows
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn current_config_target() -> ConfigTarget {
+    ConfigTarget::Unsupported
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppPaths {
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    settings_path: PathBuf,
+    chat_bar_schema_path: PathBuf,
+}
+
+impl AppPaths {
+    fn from_env() -> Result<Self> {
+        Ok(Self::from_config_dir(config_dir_for(
+            current_config_target(),
+            |name| env::var_os(name).map(PathBuf::from),
+        )?))
+    }
+
+    fn from_config_dir(config_dir: PathBuf) -> Self {
+        Self {
+            data_dir: config_dir.join(DATA_DIR),
+            settings_path: config_dir.join(SETTINGS_FILE),
+            chat_bar_schema_path: config_dir.join(CHAT_BAR_OUTPUT_SCHEMA_FILE),
+            config_dir,
+        }
+    }
+
+    fn bootstrap(&self) -> Result<()> {
+        fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("create data directory {}", self.data_dir.display()))?;
+        write_text_if_missing(&self.settings_path, DEFAULT_SETTINGS_JSON)?;
+        write_text_if_missing(
+            &self.data_dir.join(TODO_INSTRUCTIONS_FILE),
+            DEFAULT_TODO_INSTRUCTIONS,
+        )?;
+        write_text(
+            &self.chat_bar_schema_path,
+            DEFAULT_CHAT_BAR_OUTPUT_SCHEMA_JSON,
+        )?;
+
+        let themes_dir = self.config_dir.join("themes");
+        fs::create_dir_all(&themes_dir)
+            .with_context(|| format!("create themes directory {}", themes_dir.display()))?;
+        for (filename, content) in BUNDLED_THEMES {
+            write_text_if_missing(&themes_dir.join(filename), content)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn config_dir_for(
+    target: ConfigTarget,
+    get_env: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    let env_path = |name| get_env(name).filter(|path| !path.as_os_str().is_empty());
+
+    match target {
+        ConfigTarget::Linux => Ok(env_path("XDG_CONFIG_HOME")
+            .or_else(|| env_path("HOME").map(|home| home.join(".config")))
+            .ok_or_else(|| anyhow!("HOME is not set"))?
+            .join(APP_DIR_NAME)),
+        ConfigTarget::Macos => Ok(env_path("HOME")
+            .ok_or_else(|| anyhow!("HOME is not set"))?
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DIR_NAME)),
+        ConfigTarget::Windows => Ok(env_path("APPDATA")
+            .or_else(|| env_path("USERPROFILE").map(|home| home.join("AppData").join("Roaming")))
+            .ok_or_else(|| anyhow!("APPDATA is not set"))?
+            .join(APP_DIR_NAME)),
+        ConfigTarget::Unsupported => bail!("unsupported operating system"),
+    }
+}
+
+fn write_text_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    write_text(path, content)
+}
+
+fn write_text(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
 
 fn init_terminal() -> Result<Tui> {
     enable_raw_mode().context("enable raw mode")?;
@@ -362,9 +500,9 @@ struct SyntaxResources {
 }
 
 impl SyntaxResources {
-    fn new(settings: &Settings) -> Result<Self> {
+    fn new(settings: &Settings, settings_base_dir: &Path) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_newlines();
-        let theme_set = load_theme_set(settings)?;
+        let theme_set = load_theme_set(settings, settings_base_dir)?;
         let theme = theme_set
             .themes
             .get(&settings.syntax_theme)
@@ -481,12 +619,12 @@ fn ratatui_color(color: SyntectColor) -> Color {
     Color::Rgb(color.r, color.g, color.b)
 }
 
-fn load_theme_set(settings: &Settings) -> Result<ThemeSet> {
+fn load_theme_set(settings: &Settings, settings_base_dir: &Path) -> Result<ThemeSet> {
     let mut theme_set = ThemeSet::load_defaults();
-    let theme_folder = Path::new(&settings.syntax_theme_folder);
+    let theme_folder = theme_folder_path(settings, settings_base_dir);
 
     if theme_folder.exists() {
-        let custom_theme_set = ThemeSet::load_from_folder(theme_folder)
+        let custom_theme_set = ThemeSet::load_from_folder(&theme_folder)
             .with_context(|| format!("load syntax themes from {}", theme_folder.display()))?;
         theme_set.themes.extend(custom_theme_set.themes);
     }
@@ -494,13 +632,13 @@ fn load_theme_set(settings: &Settings) -> Result<ThemeSet> {
     Ok(theme_set)
 }
 
-fn load_theme_options(settings: &Settings) -> Result<Vec<String>> {
-    let theme_folder = Path::new(&settings.syntax_theme_folder);
+fn load_theme_options(settings: &Settings, settings_base_dir: &Path) -> Result<Vec<String>> {
+    let theme_folder = theme_folder_path(settings, settings_base_dir);
     if !theme_folder.exists() {
         return Ok(Vec::new());
     }
 
-    let entries = fs::read_dir(theme_folder)
+    let entries = fs::read_dir(&theme_folder)
         .with_context(|| format!("read syntax theme directory {}", theme_folder.display()))?;
     let mut options = Vec::new();
 
@@ -515,6 +653,15 @@ fn load_theme_options(settings: &Settings) -> Result<Vec<String>> {
 
     options.sort_by_key(|name| name.to_lowercase());
     Ok(options)
+}
+
+fn theme_folder_path(settings: &Settings, settings_base_dir: &Path) -> PathBuf {
+    let theme_folder = Path::new(&settings.syntax_theme_folder);
+    if theme_folder.is_absolute() {
+        theme_folder.to_path_buf()
+    } else {
+        settings_base_dir.join(theme_folder)
+    }
 }
 
 struct ProjectWatcher {
@@ -658,6 +805,8 @@ struct App {
     projects: Vec<ProjectFile>,
     settings: Settings,
     settings_path: PathBuf,
+    settings_base_dir: PathBuf,
+    chat_bar_schema_path: PathBuf,
     theme_options: Vec<String>,
     syntax_resources: SyntaxResources,
     project_watcher: Option<ProjectWatcher>,
@@ -675,16 +824,43 @@ struct App {
 }
 
 impl App {
+    fn from_paths(paths: AppPaths) -> Result<Self> {
+        Self::with_schema_path(
+            paths.data_dir,
+            paths.settings_path,
+            paths.chat_bar_schema_path,
+        )
+    }
+
+    #[cfg(test)]
     fn new(data_dir: PathBuf, settings_path: PathBuf) -> Result<Self> {
+        Self::with_schema_path(
+            data_dir,
+            settings_path,
+            PathBuf::from(CHAT_BAR_OUTPUT_SCHEMA_FILE),
+        )
+    }
+
+    fn with_schema_path(
+        data_dir: PathBuf,
+        settings_path: PathBuf,
+        chat_bar_schema_path: PathBuf,
+    ) -> Result<Self> {
         let projects = load_projects(&data_dir)?;
         let settings = load_settings(&settings_path)?;
-        let theme_options = load_theme_options(&settings)?;
-        let syntax_resources = SyntaxResources::new(&settings)?;
+        let settings_base_dir = settings_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let theme_options = load_theme_options(&settings, &settings_base_dir)?;
+        let syntax_resources = SyntaxResources::new(&settings, &settings_base_dir)?;
         Ok(Self {
             data_dir,
             projects,
             settings,
             settings_path,
+            settings_base_dir,
+            chat_bar_schema_path,
             theme_options,
             syntax_resources,
             project_watcher: None,
@@ -949,7 +1125,7 @@ impl App {
     }
 
     fn open_settings(&mut self) -> Result<()> {
-        self.theme_options = load_theme_options(&self.settings)?;
+        self.theme_options = load_theme_options(&self.settings, &self.settings_base_dir)?;
         self.settings_return_screen = self.screen;
         self.screen = Screen::Settings;
         self.settings_index = self.settings_index.min(SETTINGS_FIELDS.len() - 1);
@@ -1067,7 +1243,7 @@ impl App {
         let previous = self.settings.syntax_theme.clone();
 
         self.settings.syntax_theme = self.theme_options[next].clone();
-        match SyntaxResources::new(&self.settings) {
+        match SyntaxResources::new(&self.settings, &self.settings_base_dir) {
             Ok(resources) => self.syntax_resources = resources,
             Err(error) => {
                 self.settings.syntax_theme = previous;
@@ -1110,6 +1286,7 @@ impl App {
             backend: self.settings.llm_backend,
             base_url: self.settings.llm_base_url.clone(),
             model: self.settings.llm_model.clone(),
+            output_schema_path: self.chat_bar_schema_path.clone(),
             api_key,
             instructions,
             project,
@@ -1539,6 +1716,7 @@ struct LlmTodoRequest {
     backend: LlmBackend,
     base_url: String,
     model: String,
+    output_schema_path: PathBuf,
     api_key: Option<String>,
     instructions: String,
     project: Project,
@@ -1665,7 +1843,7 @@ fn codex_exec_args(request: &LlmTodoRequest) -> Vec<String> {
     }
     args.extend([
         "--output-schema".to_string(),
-        CHAT_BAR_OUTPUT_SCHEMA_FILE.to_string(),
+        request.output_schema_path.display().to_string(),
         "--json".to_string(),
         "-".to_string(),
     ]);
@@ -3638,7 +3816,7 @@ mod tests {
     }
 
     fn test_syntax_resources() -> SyntaxResources {
-        SyntaxResources::new(&Settings::default()).unwrap()
+        SyntaxResources::new(&Settings::default(), Path::new(".")).unwrap()
     }
 
     fn test_ui_theme() -> UiTheme {
@@ -3690,6 +3868,7 @@ mod tests {
             backend: LlmBackend::CodexExec,
             base_url: DEFAULT_LLM_BASE_URL.to_string(),
             model: DEFAULT_LLM_MODEL.to_string(),
+            output_schema_path: PathBuf::from(CHAT_BAR_OUTPUT_SCHEMA_FILE),
             api_key: None,
             instructions: "Write useful todos.".to_string(),
             project: sample_project(),
@@ -3698,6 +3877,74 @@ mod tests {
             codex_reasoning_effort: None,
             codex_fast_mode: false,
         }
+    }
+
+    #[test]
+    fn resolves_linux_and_macos_config_dirs() -> Result<()> {
+        let linux = config_dir_for(ConfigTarget::Linux, |name| match name {
+            "HOME" => Some(PathBuf::from("/home/alice")),
+            _ => None,
+        })?;
+        let xdg_linux = config_dir_for(ConfigTarget::Linux, |name| match name {
+            "XDG_CONFIG_HOME" => Some(PathBuf::from("/tmp/config")),
+            "HOME" => Some(PathBuf::from("/home/alice")),
+            _ => None,
+        })?;
+        let macos = config_dir_for(ConfigTarget::Macos, |name| match name {
+            "HOME" => Some(PathBuf::from("/Users/alice")),
+            _ => None,
+        })?;
+
+        assert_eq!(linux, PathBuf::from("/home/alice/.config/todui"));
+        assert_eq!(xdg_linux, PathBuf::from("/tmp/config/todui"));
+        assert_eq!(
+            macos,
+            PathBuf::from("/Users/alice/Library/Application Support/todui")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bootstraps_config_defaults_without_overwriting_user_files() -> Result<()> {
+        let dir = tempdir()?;
+        let paths = AppPaths::from_config_dir(dir.path().join("config"));
+
+        paths.bootstrap()?;
+
+        assert!(paths.settings_path.exists());
+        assert!(paths.data_dir.join(TODO_INSTRUCTIONS_FILE).exists());
+        assert!(paths.chat_bar_schema_path.exists());
+        for (filename, _) in BUNDLED_THEMES {
+            assert!(paths.config_dir.join("themes").join(filename).exists());
+        }
+
+        fs::write(&paths.settings_path, "custom settings")?;
+        fs::write(
+            paths.data_dir.join(TODO_INSTRUCTIONS_FILE),
+            "custom instructions",
+        )?;
+        fs::write(
+            paths.config_dir.join("themes").join(BUNDLED_THEMES[0].0),
+            "custom theme",
+        )?;
+        fs::write(&paths.chat_bar_schema_path, "old schema")?;
+
+        paths.bootstrap()?;
+
+        assert_eq!(fs::read_to_string(&paths.settings_path)?, "custom settings");
+        assert_eq!(
+            fs::read_to_string(paths.data_dir.join(TODO_INSTRUCTIONS_FILE))?,
+            "custom instructions"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.config_dir.join("themes").join(BUNDLED_THEMES[0].0))?,
+            "custom theme"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.chat_bar_schema_path)?,
+            DEFAULT_CHAT_BAR_OUTPUT_SCHEMA_JSON
+        );
+        Ok(())
     }
 
     #[test]
@@ -3790,7 +4037,7 @@ mod tests {
             ..Settings::default()
         };
 
-        let options = load_theme_options(&settings)?;
+        let options = load_theme_options(&settings, Path::new("."))?;
 
         assert_eq!(options, vec!["alpha", "zeta"]);
         Ok(())
@@ -3953,6 +4200,11 @@ mod tests {
             })
             .to_string(),
         )?;
+        let themes_dir = dir.path().join("themes");
+        fs::create_dir(&themes_dir)?;
+        for (filename, content) in BUNDLED_THEMES {
+            fs::write(themes_dir.join(filename), content)?;
+        }
 
         let mut app = App::new(data_dir, settings_path.clone())?;
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
@@ -3981,7 +4233,7 @@ mod tests {
             ..Settings::default()
         };
 
-        SyntaxResources::new(&settings)?;
+        SyntaxResources::new(&settings, Path::new("."))?;
 
         Ok(())
     }
@@ -4058,10 +4310,13 @@ mod tests {
 
     #[test]
     fn ui_theme_uses_selected_syntax_theme_colors() -> Result<()> {
-        let resources = SyntaxResources::new(&Settings {
-            syntax_theme: "base16-black-metal-venom".to_string(),
-            ..Settings::default()
-        })?;
+        let resources = SyntaxResources::new(
+            &Settings {
+                syntax_theme: "base16-black-metal-venom".to_string(),
+                ..Settings::default()
+            },
+            Path::new("."),
+        )?;
 
         assert_eq!(resources.ui_theme.background, Color::Rgb(0, 0, 0));
         assert_eq!(resources.ui_theme.accent, Color::Rgb(252, 48, 46));
