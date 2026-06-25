@@ -1,0 +1,13 @@
+{
+  "statusline_message_timeout_ms": 3000,
+  "syntax_theme": "base16-onedark",
+  "syntax_theme_folder": "themes",
+  "use_theme_app_background": false,
+  "use_theme_modal_background": true,
+  "task_content_wrap_cols": 80,
+  "llm_backend": "codex_exec",
+  "codex_reasoning_effort": "medium",
+  "codex_fast_mode": true,
+  "llm_base_url": "https://api.openai.com/v1",
+  "llm_model": "gpt-5.5"
+}
