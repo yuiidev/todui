@@ -9,5 +9,7 @@
   "codex_reasoning_effort": "medium",
   "codex_fast_mode": true,
   "llm_base_url": "https://api.openai.com/v1",
-  "llm_model": "gpt-5.5"
+  "llm_model": "gpt-5.5",
+  "agent_skill_output_dir": null,
+  "agent_skill_setup_dismissed": false
 }

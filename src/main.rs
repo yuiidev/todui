@@ -1,6 +1,6 @@
 use std::{
     env, fmt, fs,
-    io::{self, Write, stdout},
+    io::{self, ErrorKind, Write, stdout},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -39,6 +39,9 @@ use uuid::Uuid;
 const DATA_DIR: &str = "data";
 const SETTINGS_FILE: &str = "settings.json";
 const TODO_INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
+const AGENT_SKILLS_DIR: &str = "agent-skills";
+const TODO_AGENT_SKILL_NAME: &str = "make-todo";
+const TODO_AGENT_SKILL_FILE: &str = "SKILL.md";
 const LLM_API_KEY_ENV: &str = "TODUI_LLM_API_KEY";
 const CHAT_BAR_OUTPUT_SCHEMA_FILE: &str = "schemas/chat-bar-todo.schema.json";
 const CHAT_BAR_ERROR_LOG_FILE: &str = "chat-bar-error.log";
@@ -162,6 +165,7 @@ impl AppPaths {
             &self.chat_bar_schema_path,
             DEFAULT_CHAT_BAR_OUTPUT_SCHEMA_JSON,
         )?;
+        write_managed_agent_skill(&managed_agent_skill_dir(&self.config_dir), &self.data_dir)?;
 
         let themes_dir = self.config_dir.join("themes");
         fs::create_dir_all(&themes_dir)
@@ -212,6 +216,188 @@ fn write_text(path: &Path, content: &str) -> Result<()> {
             .with_context(|| format!("create directory {}", parent.display()))?;
     }
     fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn managed_agent_skill_dir(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join(AGENT_SKILLS_DIR)
+        .join(TODO_AGENT_SKILL_NAME)
+}
+
+fn write_managed_agent_skill(skill_dir: &Path, data_dir: &Path) -> Result<()> {
+    write_text(
+        &skill_dir.join(TODO_AGENT_SKILL_FILE),
+        &todo_agent_skill_markdown(data_dir),
+    )
+}
+
+fn todo_agent_skill_markdown(data_dir: &Path) -> String {
+    let instructions_path = data_dir.join(TODO_INSTRUCTIONS_FILE);
+    format!(
+        r#"---
+name: make-todo
+description: Create todo entries for the user. Use when the user says "make a todo", "add a todo", "create a todo", "mental note", "note this", or asks to remember a task for later.
+---
+
+Read `{}`.
+
+Create or update todo entries only in `{}`, following that file exactly.
+
+If writing there requires approval, request it.
+"#,
+        instructions_path.display(),
+        data_dir.display(),
+    )
+}
+
+fn detected_agent_skill_output_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    [
+        home.join(".agents").join("skills"),
+        home.join(".claude").join("skills"),
+    ]
+    .into_iter()
+    .filter(|path| path.is_dir())
+    .collect()
+}
+
+fn env_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+fn expand_home_path(path: &str, home: Option<PathBuf>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(path);
+    };
+
+    if path == "~" {
+        home
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSkillLinkState {
+    Installed,
+    NotInstalled,
+    Conflict,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AgentSkillInstallReport {
+    installed: usize,
+    already: usize,
+    conflicts: usize,
+}
+
+impl AgentSkillInstallReport {
+    fn status_message(self) -> &'static str {
+        if self.conflicts > 0 {
+            "todo skill conflict"
+        } else if self.installed > 0 {
+            "todo skill installed"
+        } else if self.already > 0 {
+            "todo skill already installed"
+        } else {
+            "todo skill not installed"
+        }
+    }
+}
+
+fn install_agent_skill(
+    output_dirs: &[PathBuf],
+    source_dir: &Path,
+) -> Result<AgentSkillInstallReport> {
+    let mut report = AgentSkillInstallReport::default();
+
+    for output_dir in output_dirs {
+        fs::create_dir_all(output_dir)
+            .with_context(|| format!("create skill output directory {}", output_dir.display()))?;
+        let link_path = output_dir.join(TODO_AGENT_SKILL_NAME);
+        match agent_skill_link_state(&link_path, source_dir)? {
+            AgentSkillLinkState::Installed => report.already += 1,
+            AgentSkillLinkState::Conflict => report.conflicts += 1,
+            AgentSkillLinkState::NotInstalled => {
+                symlink_dir(source_dir, &link_path).with_context(|| {
+                    format!(
+                        "symlink todo skill {} to {}",
+                        source_dir.display(),
+                        link_path.display()
+                    )
+                })?;
+                report.installed += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn agent_skill_link_state(link_path: &Path, source_dir: &Path) -> Result<AgentSkillLinkState> {
+    let metadata = match fs::symlink_metadata(link_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(AgentSkillLinkState::NotInstalled);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", link_path.display()));
+        }
+    };
+
+    if !metadata.file_type().is_symlink() {
+        return Ok(AgentSkillLinkState::Conflict);
+    }
+
+    let target = fs::read_link(link_path)
+        .with_context(|| format!("read symlink {}", link_path.display()))?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(target)
+    };
+
+    if same_existing_path(&resolved, source_dir) {
+        Ok(AgentSkillLinkState::Installed)
+    } else {
+        Ok(AgentSkillLinkState::Conflict)
+    }
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+#[cfg(unix)]
+fn symlink_dir(source_dir: &Path, link_path: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source_dir, link_path)
+}
+
+#[cfg(windows)]
+fn symlink_dir(source_dir: &Path, link_path: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(source_dir, link_path)
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -413,6 +599,8 @@ struct Settings {
     codex_fast_mode: bool,
     llm_base_url: String,
     llm_model: String,
+    agent_skill_output_dir: Option<String>,
+    agent_skill_setup_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -501,6 +689,8 @@ impl Default for Settings {
             codex_fast_mode: false,
             llm_base_url: DEFAULT_LLM_BASE_URL.to_string(),
             llm_model: DEFAULT_LLM_MODEL.to_string(),
+            agent_skill_output_dir: None,
+            agent_skill_setup_dismissed: false,
         }
     }
 }
@@ -542,8 +732,12 @@ fn short_error_message(error: &anyhow::Error) -> &'static str {
         "no project selected"
     } else if text.contains("empty prompt") {
         "empty prompt"
+    } else if text.contains("setting cannot be empty") {
+        "empty setting"
     } else if text.contains(LLM_API_KEY_ENV) {
         "missing api key"
+    } else if text.contains("skill") || text.contains("symlink") {
+        "skill setup failed"
     } else if text.contains("codex") {
         "codex failed; see log"
     } else if text.contains("llm") {
@@ -835,9 +1029,10 @@ enum SettingsField {
     CodexFastMode,
     LlmBaseUrl,
     LlmModel,
+    TodoSkill,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 9] = [
+const SETTINGS_FIELDS: [SettingsField; 10] = [
     SettingsField::SyntaxTheme,
     SettingsField::AppBackground,
     SettingsField::ModalBackground,
@@ -847,6 +1042,7 @@ const SETTINGS_FIELDS: [SettingsField; 9] = [
     SettingsField::CodexFastMode,
     SettingsField::LlmBaseUrl,
     SettingsField::LlmModel,
+    SettingsField::TodoSkill,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -896,11 +1092,13 @@ struct App {
 
 impl App {
     fn from_paths(paths: AppPaths) -> Result<Self> {
-        Self::with_schema_path(
+        let mut app = Self::with_schema_path(
             paths.data_dir,
             paths.settings_path,
             paths.chat_bar_schema_path,
-        )
+        )?;
+        app.setup_agent_skill_on_startup()?;
+        Ok(app)
     }
 
     #[cfg(test)]
@@ -1108,8 +1306,21 @@ impl App {
                     Ok(())
                 }
                 SettingTextAction::Cancel => {
-                    self.mode = Mode::Normal;
-                    Ok(())
+                    if form.field == SettingsField::TodoSkill
+                        && form.dismiss_agent_skill_setup_on_cancel
+                    {
+                        self.settings.agent_skill_setup_dismissed = true;
+                        if let Err(error) = save_settings(&self.settings_path, &self.settings) {
+                            self.mode = Mode::Normal;
+                            Err(error)
+                        } else {
+                            self.mode = Mode::Normal;
+                            Ok(())
+                        }
+                    } else {
+                        self.mode = Mode::Normal;
+                        Ok(())
+                    }
                 }
                 SettingTextAction::Save => {
                     self.mode = Mode::EditingSetting(form);
@@ -1207,6 +1418,116 @@ impl App {
         Ok(())
     }
 
+    fn setup_agent_skill_on_startup(&mut self) -> Result<()> {
+        self.setup_agent_skill_on_startup_with_home(env_home_dir())
+    }
+
+    fn setup_agent_skill_on_startup_with_home(&mut self, home: Option<PathBuf>) -> Result<()> {
+        self.ensure_managed_agent_skill()?;
+        let targets = self.agent_skill_target_dirs_with_home(home);
+
+        if !targets.is_empty() {
+            match install_agent_skill(&targets, &self.agent_skill_source_dir()) {
+                Ok(report) if report.installed > 0 || report.conflicts > 0 => {
+                    self.set_status_message(report.status_message());
+                }
+                Ok(_) => {}
+                Err(error) => self.set_status_message(short_error_message(&error)),
+            }
+        } else if !self.settings.agent_skill_setup_dismissed {
+            self.start_agent_skill_output_modal(true);
+        }
+
+        Ok(())
+    }
+
+    fn install_agent_skill_from_settings(&mut self) -> Result<()> {
+        self.ensure_managed_agent_skill()?;
+        let targets = self.agent_skill_target_dirs();
+
+        if targets.is_empty() {
+            self.start_agent_skill_output_modal(false);
+            return Ok(());
+        }
+
+        let report = install_agent_skill(&targets, &self.agent_skill_source_dir())?;
+        self.set_status_message(report.status_message());
+        Ok(())
+    }
+
+    fn start_agent_skill_output_modal(&mut self, dismiss_on_cancel: bool) {
+        let value = self
+            .settings
+            .agent_skill_output_dir
+            .clone()
+            .unwrap_or_default();
+        self.mode =
+            Mode::EditingSetting(SettingTextForm::new_agent_skill(value, dismiss_on_cancel));
+    }
+
+    fn save_agent_skill_output_dir(&mut self, value: String) -> Result<()> {
+        let output_dir = expand_home_path(&value, env_home_dir());
+        self.settings.agent_skill_output_dir = Some(output_dir.display().to_string());
+        self.settings.agent_skill_setup_dismissed = false;
+        save_settings(&self.settings_path, &self.settings)?;
+
+        self.ensure_managed_agent_skill()?;
+        let report = install_agent_skill(&[output_dir], &self.agent_skill_source_dir())?;
+        self.mode = Mode::Normal;
+        self.set_status_message(report.status_message());
+        Ok(())
+    }
+
+    fn ensure_managed_agent_skill(&self) -> Result<()> {
+        write_managed_agent_skill(&self.agent_skill_source_dir(), &self.data_dir)
+    }
+
+    fn agent_skill_source_dir(&self) -> PathBuf {
+        managed_agent_skill_dir(&self.settings_base_dir)
+    }
+
+    fn agent_skill_target_dirs(&self) -> Vec<PathBuf> {
+        self.agent_skill_target_dirs_with_home(env_home_dir())
+    }
+
+    fn agent_skill_target_dirs_with_home(&self, home: Option<PathBuf>) -> Vec<PathBuf> {
+        let mut dirs = detected_agent_skill_output_dirs(home);
+        if let Some(path) = self
+            .settings
+            .agent_skill_output_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            dirs.push(PathBuf::from(path));
+        }
+        dedup_paths(dirs)
+    }
+
+    fn agent_skill_status_label(&self) -> &'static str {
+        let targets = self.agent_skill_target_dirs();
+        if targets.is_empty() {
+            return "not installed";
+        }
+
+        let source_dir = self.agent_skill_source_dir();
+        let mut installed = 0;
+        for target in &targets {
+            match agent_skill_link_state(&target.join(TODO_AGENT_SKILL_NAME), &source_dir) {
+                Ok(AgentSkillLinkState::Installed) => installed += 1,
+                Ok(AgentSkillLinkState::NotInstalled) => return "not installed",
+                Ok(AgentSkillLinkState::Conflict) => return "conflict",
+                Err(_) => return "error",
+            }
+        }
+
+        if installed == targets.len() {
+            "installed"
+        } else {
+            "not installed"
+        }
+    }
+
     fn open_chat_bar(&mut self) -> Result<()> {
         if self.current_project().is_none() {
             bail!("no project selected");
@@ -1226,7 +1547,8 @@ impl App {
             | SettingsField::TaskContentWrapCols
             | SettingsField::LlmBackend
             | SettingsField::CodexReasoningEffort
-            | SettingsField::CodexFastMode => return,
+            | SettingsField::CodexFastMode
+            | SettingsField::TodoSkill => return,
         };
 
         self.mode = Mode::EditingSetting(SettingTextForm::new(field, value));
@@ -1244,6 +1566,7 @@ impl App {
                 self.settings.llm_base_url = value;
             }
             SettingsField::LlmModel => self.settings.llm_model = value,
+            SettingsField::TodoSkill => return self.save_agent_skill_output_dir(value),
             SettingsField::SyntaxTheme
             | SettingsField::AppBackground
             | SettingsField::ModalBackground
@@ -1281,6 +1604,10 @@ impl App {
             }
             SettingsField::LlmBaseUrl | SettingsField::LlmModel => {
                 self.start_editing_setting(SETTINGS_FIELDS[self.settings_index]);
+                return Ok(());
+            }
+            SettingsField::TodoSkill => {
+                self.install_agent_skill_from_settings()?;
                 return Ok(());
             }
         }
@@ -1801,6 +2128,7 @@ struct ChatForm {
 struct SettingTextForm {
     field: SettingsField,
     input: EditableField,
+    dismiss_agent_skill_setup_on_cancel: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2344,6 +2672,15 @@ impl SettingTextForm {
         Self {
             field,
             input: EditableField::single_line(field.label(), value),
+            dismiss_agent_skill_setup_on_cancel: false,
+        }
+    }
+
+    fn new_agent_skill(value: String, dismiss_agent_skill_setup_on_cancel: bool) -> Self {
+        Self {
+            field: SettingsField::TodoSkill,
+            input: EditableField::single_line("Output directory", value),
+            dismiss_agent_skill_setup_on_cancel,
         }
     }
 
@@ -2382,6 +2719,14 @@ impl SettingsField {
             SettingsField::CodexFastMode => "Codex fast",
             SettingsField::LlmBaseUrl => "LLM base URL",
             SettingsField::LlmModel => "LLM model",
+            SettingsField::TodoSkill => "Todo skill",
+        }
+    }
+
+    fn modal_title(self) -> &'static str {
+        match self {
+            SettingsField::TodoSkill => "Todo Skill Location",
+            _ => self.label(),
         }
     }
 }
@@ -3115,6 +3460,9 @@ fn settings_items(app: &App) -> Vec<ListItem<'static>> {
                 ),
                 SettingsField::LlmBaseUrl => (field.label(), app.settings.llm_base_url.clone()),
                 SettingsField::LlmModel => (field.label(), app.settings.llm_model.clone()),
+                SettingsField::TodoSkill => {
+                    (field.label(), app.agent_skill_status_label().to_string())
+                }
             };
 
             ListItem::new(Line::from(vec![
@@ -3420,7 +3768,7 @@ fn draw_setting_text_modal(
 
     let style = theme.style(use_theme_background);
     let block = Block::default()
-        .title(panel_title(form.field.label(), theme))
+        .title(panel_title(form.field.modal_title(), theme))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent))
         .style(style);
@@ -4205,6 +4553,9 @@ mod tests {
         assert!(paths.settings_path.exists());
         assert!(paths.data_dir.join(TODO_INSTRUCTIONS_FILE).exists());
         assert!(paths.chat_bar_schema_path.exists());
+        let skill_path = managed_agent_skill_dir(&paths.config_dir).join(TODO_AGENT_SKILL_FILE);
+        assert!(skill_path.exists());
+        assert!(fs::read_to_string(&skill_path)?.contains(paths.data_dir.to_str().unwrap()));
         for (filename, _) in BUNDLED_THEMES {
             assert!(paths.config_dir.join("themes").join(filename).exists());
         }
@@ -4218,6 +4569,7 @@ mod tests {
             paths.config_dir.join("themes").join(BUNDLED_THEMES[0].0),
             "custom theme",
         )?;
+        fs::write(&skill_path, "old skill")?;
         fs::write(&paths.chat_bar_schema_path, "old schema")?;
 
         paths.bootstrap()?;
@@ -4235,6 +4587,65 @@ mod tests {
             fs::read_to_string(&paths.chat_bar_schema_path)?,
             DEFAULT_CHAT_BAR_OUTPUT_SCHEMA_JSON
         );
+        assert!(fs::read_to_string(&skill_path)?.contains("name: make-todo"));
+        Ok(())
+    }
+
+    #[test]
+    fn detects_existing_agent_skill_output_dirs() -> Result<()> {
+        let dir = tempdir()?;
+        let home = dir.path();
+        let codex_dir = home.join(".agents").join("skills");
+        let claude_dir = home.join(".claude").join("skills");
+        fs::create_dir_all(&codex_dir)?;
+
+        assert_eq!(
+            detected_agent_skill_output_dirs(Some(home.to_path_buf())),
+            vec![codex_dir.clone()]
+        );
+
+        fs::create_dir_all(&claude_dir)?;
+        assert_eq!(
+            detected_agent_skill_output_dirs(Some(home.to_path_buf())),
+            vec![codex_dir, claude_dir]
+        );
+        assert!(detected_agent_skill_output_dirs(None).is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installs_agent_skill_symlink_without_overwriting_conflicts() -> Result<()> {
+        let dir = tempdir()?;
+        let source = dir.path().join("source").join(TODO_AGENT_SKILL_NAME);
+        write_managed_agent_skill(&source, &dir.path().join("data"))?;
+        let clean_output = dir.path().join("clean");
+        let conflict_output = dir.path().join("conflict");
+        fs::create_dir_all(&conflict_output)?;
+        fs::write(conflict_output.join(TODO_AGENT_SKILL_NAME), "existing")?;
+
+        let report =
+            install_agent_skill(&[clean_output.clone(), conflict_output.clone()], &source)?;
+
+        assert_eq!(
+            report,
+            AgentSkillInstallReport {
+                installed: 1,
+                already: 0,
+                conflicts: 1,
+            }
+        );
+        assert_eq!(
+            agent_skill_link_state(&clean_output.join(TODO_AGENT_SKILL_NAME), &source)?,
+            AgentSkillLinkState::Installed
+        );
+        assert_eq!(
+            fs::read_to_string(conflict_output.join(TODO_AGENT_SKILL_NAME))?,
+            "existing"
+        );
+
+        let report = install_agent_skill(&[clean_output], &source)?;
+        assert_eq!(report.already, 1);
         Ok(())
     }
 
@@ -4319,6 +4730,8 @@ mod tests {
         assert!(!settings.codex_fast_mode);
         assert_eq!(settings.llm_base_url, DEFAULT_LLM_BASE_URL);
         assert_eq!(settings.llm_model, DEFAULT_LLM_MODEL);
+        assert_eq!(settings.agent_skill_output_dir, None);
+        assert!(!settings.agent_skill_setup_dismissed);
         assert_eq!(
             settings.statusline_message_timeout(),
             Duration::from_millis(1250)
@@ -4405,6 +4818,76 @@ mod tests {
             Some(CodexReasoningEffort::Minimal)
         );
         assert!(saved.codex_fast_mode);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_prompts_for_agent_skill_dir_when_no_targets_exist() -> Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let settings_path = dir.path().join("settings.json");
+        let mut app = App::new(data_dir, settings_path.clone())?;
+
+        app.setup_agent_skill_on_startup_with_home(Some(dir.path().join("home")))?;
+
+        match &app.mode {
+            Mode::EditingSetting(form) => {
+                assert_eq!(form.field, SettingsField::TodoSkill);
+                assert!(form.dismiss_agent_skill_setup_on_cancel);
+            }
+            _ => panic!("expected todo skill location modal"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let saved = load_settings(&settings_path)?;
+
+        assert!(saved.agent_skill_setup_dismissed);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_reports_agent_skill_install_errors_without_aborting() -> Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let output_file = dir.path().join("skills-file");
+        fs::write(&output_file, "")?;
+        let mut app = App::new(data_dir, dir.path().join("settings.json"))?;
+        app.settings.agent_skill_output_dir = Some(output_file.display().to_string());
+
+        app.setup_agent_skill_on_startup_with_home(None)?;
+
+        assert_eq!(app.status_message_text(), Some("skill setup failed"));
+        assert!(matches!(app.mode, Mode::Normal));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_agent_skill_output_dir_creates_symlink_and_setting() -> Result<()> {
+        let dir = tempdir()?;
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir)?;
+        let settings_path = dir.path().join("settings.json");
+        let output_dir = dir.path().join("skills");
+        let mut app = App::new(data_dir, settings_path.clone())?;
+
+        app.save_agent_skill_output_dir(output_dir.display().to_string())?;
+
+        let saved = load_settings(&settings_path)?;
+        assert_eq!(
+            saved.agent_skill_output_dir.as_deref(),
+            Some(output_dir.to_str().unwrap())
+        );
+        assert_eq!(
+            agent_skill_link_state(
+                &output_dir.join(TODO_AGENT_SKILL_NAME),
+                &managed_agent_skill_dir(dir.path())
+            )?,
+            AgentSkillLinkState::Installed
+        );
+        assert_eq!(app.status_message_text(), Some("todo skill installed"));
         Ok(())
     }
 
