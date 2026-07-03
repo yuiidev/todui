@@ -10,6 +10,24 @@ Each TODO should be Human-first oriented, this means:
 - When providing mappings or any other sort of information to could be concisely represented as a table prefer that over pure text.
 - Do not put absolute path references to anything in the TODO unless it is as part of a argument to a cli tool, instead only filename + extension + line number (if relevant); example: (example-file.txt:64)
 
+## Writing Prompts
+
+Use `prompt` for LLM-agent execution guidance, not for human-facing task explanation. A good prompt should let a fresh agent continue from the current session state without guessing intent.
+
+Include:
+- The concrete goal and expected final outcome.
+- Relevant context from the session so far: decisions made, rejected approaches, partial work, blockers, and why they matter.
+- Files, symbols, commands, services, branches, or test names the agent should inspect or use.
+- Constraints the agent must preserve, such as compatibility, formatting, security, data safety, or user preferences.
+- The smallest useful verification steps, for example exact tests, commands, screenshots, or manual checks.
+
+Avoid:
+- Repeating the full human-facing `content` unless the agent needs a condensed execution version.
+- Vague instructions like "fix this" or "make it better" without success criteria.
+- Secrets, credentials, private tokens, or values that should not be stored in project JSON.
+- Large raw logs, stack traces, or pasted files when a short summary plus filename/line reference is enough.
+- Speculative future work unrelated to completing this task.
+
 ## Example Project
 
 ````json
@@ -24,6 +42,7 @@ Each TODO should be Human-first oriented, this means:
       "id": "0197f4f6-5e70-7c7d-9e7b-66b93df52a64",
       "title": "Replace placeholder implementation",
       "content": "Explain the task in enough detail that a future agent can continue without rediscovery. Include context, reasoning, decisions already made, and any constraints.\n\nUse `inline code` for identifiers and commands. Use fenced code blocks when useful:\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```",
+      "prompt": "LLM-agent oriented instructions for completing this task. Include execution strategy, constraints, and expected checks. Use `null` when no agent prompt is needed.",
       "labels": [
         "rust",
         "cleanup"
@@ -50,6 +69,7 @@ Each TODO should be Human-first oriented, this means:
 - `id`: Required string. Use a UUIDv7 and never change it after creation.
 - `title`: Required string. Write a short imperative title, for example `Replace ext-intl with Symfony Intl`.
 - `content`: Required string. Describe the context, reasoning, decisions made, constraints, and expected outcome. Newlines are supported as JSON string escapes such as `\n`.
+- `prompt`: Required value. Use `null` for human-only tasks. External LLMs generating tasks from this file must include a non-empty string when the task is intended for an LLM agent.
 - `labels`: Required array of strings. Use labels for topic, area, urgency, or tool context.
 - `branch`: Required value. Use `null` when the branch is `main` or irrelevant to the TODO.
 - `created_at`: Required RFC3339 datetime string with timezone. Set this when creating the task and never change it.

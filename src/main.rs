@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -41,6 +42,7 @@ const TODO_INSTRUCTIONS_FILE: &str = "INSTRUCTIONS.md";
 const LLM_API_KEY_ENV: &str = "TODUI_LLM_API_KEY";
 const CHAT_BAR_OUTPUT_SCHEMA_FILE: &str = "schemas/chat-bar-todo.schema.json";
 const CHAT_BAR_ERROR_LOG_FILE: &str = "chat-bar-error.log";
+const EMPTY_VALUE: &str = "—";
 const APP_DIR_NAME: &str = "todui";
 const HIDE_COMPLETED_AFTER_DAYS: i64 = 14;
 const DEFAULT_TASK_CONTENT_WRAP_COLS: usize = 120;
@@ -74,9 +76,9 @@ Output contract:
 - Return only one valid JSON object.
 - Do not include Markdown, code fences, comments, explanations, or surrounding text.
 - The first non-whitespace character must be `{` and the last non-whitespace character must be `}`.
-- Required keys: "title", "content", "labels", "branch", "due_at".
+- Required keys: "title", "content", "prompt", "labels", "branch", "due_at".
 - Do not include "id", "created_at", "updated_at", or "completed_at".
-- Use null for "branch" or "due_at" when absent."#;
+- Use null for "prompt", "branch", or "due_at" when absent."#;
 
 fn main() -> Result<()> {
     let paths = AppPaths::from_env()?;
@@ -212,6 +214,21 @@ fn write_text(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|| format!("write {}", path.display()))
 }
 
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut out = stdout();
+    write_clipboard_sequence(&mut out, text)?;
+    out.flush().context("flush clipboard sequence")
+}
+
+fn write_clipboard_sequence(writer: &mut impl Write, text: &str) -> Result<()> {
+    write!(
+        writer,
+        "\x1b]52;c;{}\x07",
+        BASE64_STANDARD.encode(text.as_bytes())
+    )
+    .context("write clipboard sequence")
+}
+
 fn init_terminal() -> Result<Tui> {
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
@@ -261,6 +278,8 @@ struct Task {
     id: String,
     title: String,
     content: String,
+    #[serde(default)]
+    prompt: Option<String>,
     labels: Vec<String>,
     branch: Option<String>,
     created_at: String,
@@ -1078,9 +1097,9 @@ impl App {
                     self.mode = Mode::Normal;
                     Ok(())
                 }
-                ChatAction::Submit(prompt) => {
+                ChatAction::Submit(prompt, include_agent_prompt) => {
                     self.mode = Mode::Chat(form);
-                    self.start_llm_todo_request(prompt)
+                    self.start_llm_todo_request(prompt, include_agent_prompt)
                 }
             },
             Mode::EditingSetting(mut form) => match form.handle_key(key) {
@@ -1125,6 +1144,9 @@ impl App {
             KeyCode::Char('h') => self.toggle_hidden_tasks(),
             KeyCode::Char('e') => self.start_editing_selected_task(),
             KeyCode::Char('d') => self.start_delete_confirmation(),
+            KeyCode::Char('p') if self.screen == Screen::TaskDetail => {
+                self.copy_selected_task_prompt()
+            }
             KeyCode::Home => {
                 self.task_index = 0;
                 self.detail_scroll = 0;
@@ -1307,7 +1329,7 @@ impl App {
         Ok(())
     }
 
-    fn start_llm_todo_request(&mut self, prompt: String) -> Result<()> {
+    fn start_llm_todo_request(&mut self, prompt: String, include_agent_prompt: bool) -> Result<()> {
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             bail!("empty prompt");
@@ -1344,6 +1366,7 @@ impl App {
             instructions,
             project,
             user_prompt: prompt,
+            include_agent_prompt,
             requested_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             codex_reasoning_effort: self.settings.codex_reasoning_effort,
             codex_fast_mode: self.settings.codex_fast_mode,
@@ -1382,8 +1405,13 @@ impl App {
             return;
         }
 
+        let include_agent_prompt = match &self.mode {
+            Mode::Chat(form) => form.include_agent_prompt,
+            _ => return,
+        };
+
         match result {
-            Ok(draft) => match llm_draft_to_task(draft, Utc::now()) {
+            Ok(draft) => match llm_draft_to_task(draft, Utc::now(), include_agent_prompt) {
                 Ok(task) => self.open_llm_draft(task),
                 Err(error) => {
                     self.mode = Mode::Normal;
@@ -1547,6 +1575,20 @@ impl App {
             }
             Screen::Settings => {}
         }
+        Ok(())
+    }
+
+    fn copy_selected_task_prompt(&mut self) -> Result<()> {
+        let prompt = self
+            .current_task()
+            .and_then(|task| task.prompt.as_deref())
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .ok_or_else(|| anyhow!("empty prompt"))?
+            .to_string();
+
+        copy_to_clipboard(&prompt)?;
+        self.set_status_message("prompt copied");
         Ok(())
     }
 
@@ -1751,6 +1793,7 @@ struct EditForm {
 #[derive(Debug)]
 struct ChatForm {
     input: EditableField,
+    include_agent_prompt: bool,
     pending: bool,
 }
 
@@ -1780,7 +1823,7 @@ enum EditAction {
 #[derive(Debug, PartialEq, Eq)]
 enum ChatAction {
     None,
-    Submit(String),
+    Submit(String, bool),
     Cancel,
 }
 
@@ -1795,6 +1838,7 @@ enum SettingTextAction {
 struct TaskUpdate {
     title: String,
     content: String,
+    prompt: Option<String>,
     labels: Vec<String>,
     branch: Option<String>,
     completed_at: Option<String>,
@@ -1813,6 +1857,7 @@ struct LlmTodoRequest {
     instructions: String,
     project: Project,
     user_prompt: String,
+    include_agent_prompt: bool,
     requested_at: String,
     codex_reasoning_effort: Option<CodexReasoningEffort>,
     codex_fast_mode: bool,
@@ -1823,6 +1868,7 @@ struct LlmTodoRequest {
 struct LlmTodoDraft {
     title: String,
     content: String,
+    prompt: Option<String>,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
@@ -1834,6 +1880,7 @@ struct LlmTodoDraft {
 fn apply_task_update(task: &mut Task, update: TaskUpdate, touch_updated_at: bool) {
     task.title = update.title;
     task.content = update.content;
+    task.prompt = update.prompt;
     task.labels = update.labels;
     task.branch = update.branch;
     task.completed_at = update.completed_at;
@@ -1978,9 +2025,16 @@ fn llm_request_body(request: &LlmTodoRequest) -> Value {
 }
 
 fn chat_bar_system_prompt(request: &LlmTodoRequest) -> String {
+    let prompt_instruction = if request.include_agent_prompt {
+        r#"Prompt mode: return a non-empty "prompt" string with LLM-agent oriented instructions for completing the todo."#
+    } else {
+        r#"Prompt mode: return "prompt": null. The todo should remain human-facing only."#
+    };
+
     format!(
-        "{}\n\nTODO data instructions:\n{}\n\nCurrent time: {}\n\nSelected project:\n{}",
+        "{}\n\n{}\n\nTODO data instructions:\n{}\n\nCurrent time: {}\n\nSelected project:\n{}",
         CHAT_BAR_JSON_HARNESS,
+        prompt_instruction,
         request.instructions.trim(),
         request.requested_at,
         llm_project_context(&request.project)
@@ -2043,10 +2097,22 @@ fn parse_codex_json_final_message(stdout: &str) -> Result<LlmTodoDraft> {
 }
 
 fn parse_todo_draft_json(content: &str) -> Result<LlmTodoDraft> {
-    serde_json::from_str::<LlmTodoDraft>(content.trim()).context("parse llm todo json")
+    let value = serde_json::from_str::<Value>(content.trim()).context("parse llm todo json")?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("prompt"))
+    {
+        bail!("parse llm todo json: missing prompt");
+    }
+
+    serde_json::from_value::<LlmTodoDraft>(value).context("parse llm todo json")
 }
 
-fn llm_draft_to_task(draft: LlmTodoDraft, now: DateTime<Utc>) -> Result<Task> {
+fn llm_draft_to_task(
+    draft: LlmTodoDraft,
+    now: DateTime<Utc>,
+    include_agent_prompt: bool,
+) -> Result<Task> {
     let title = draft.title.trim().to_string();
     if title.is_empty() {
         bail!("draft title cannot be empty");
@@ -2057,10 +2123,18 @@ fn llm_draft_to_task(draft: LlmTodoDraft, now: DateTime<Utc>) -> Result<Task> {
         bail!("draft content cannot be empty");
     }
 
+    let prompt = draft.prompt.and_then(|prompt| parse_nullable_text(&prompt));
+    let prompt = if include_agent_prompt {
+        Some(prompt.ok_or_else(|| anyhow!("draft prompt cannot be empty"))?)
+    } else {
+        None
+    };
+
     Ok(Task {
         id: Uuid::now_v7().to_string(),
         title,
         content,
+        prompt,
         labels: draft
             .labels
             .into_iter()
@@ -2084,6 +2158,7 @@ impl EditForm {
             fields: vec![
                 EditableField::single_line("Title", task.title.clone()),
                 EditableField::multi_line("Content", task.content.clone()),
+                EditableField::multi_line("Prompt", task.prompt.clone().unwrap_or_default()),
                 EditableField::single_line("Labels", task.labels.join(", ")),
                 EditableField::single_line("Branch", task.branch.clone().unwrap_or_default()),
                 EditableField::single_line(
@@ -2208,10 +2283,11 @@ impl EditForm {
         Ok(TaskUpdate {
             title,
             content: self.fields[1].value.clone(),
-            labels: parse_labels(&self.fields[2].value),
-            branch: parse_nullable_text(&self.fields[3].value),
-            completed_at: parse_nullable_datetime(&self.fields[4].value, "completed_at")?,
-            due_at: parse_nullable_datetime(&self.fields[5].value, "due_at")?,
+            prompt: parse_nullable_text(&self.fields[2].value),
+            labels: parse_labels(&self.fields[3].value),
+            branch: parse_nullable_text(&self.fields[4].value),
+            completed_at: parse_nullable_datetime(&self.fields[5].value, "completed_at")?,
+            due_at: parse_nullable_datetime(&self.fields[6].value, "due_at")?,
         })
     }
 
@@ -2233,6 +2309,7 @@ impl ChatForm {
     fn new() -> Self {
         Self {
             input: EditableField::single_line("Prompt", String::new()),
+            include_agent_prompt: false,
             pending: false,
         }
     }
@@ -2247,7 +2324,13 @@ impl ChatForm {
 
         match key.code {
             KeyCode::Esc => ChatAction::Cancel,
-            KeyCode::Enter => ChatAction::Submit(self.input.value.clone()),
+            KeyCode::Enter => {
+                ChatAction::Submit(self.input.value.clone(), self.include_agent_prompt)
+            }
+            KeyCode::Tab => {
+                self.include_agent_prompt = !self.include_agent_prompt;
+                ChatAction::None
+            }
             _ => {
                 handle_single_line_input(&mut self.input, key);
                 ChatAction::None
@@ -2914,6 +2997,22 @@ fn draw_task_detail_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
+    let body_chunks = if task
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(100)])
+            .split(chunks[1])
+    };
+
     frame.render_widget(
         Paragraph::new(render_content_lines(
             &task.content,
@@ -2927,8 +3026,30 @@ fn draw_task_detail_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
         .style(style)
         .scroll((app.detail_scroll, 0)),
-        chunks[1],
+        body_chunks[0],
     );
+
+    if let Some(prompt) = task
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        frame.render_widget(
+            Paragraph::new(render_content_lines(
+                prompt,
+                &app.syntax_resources,
+                app.settings.task_content_wrap_cols,
+            ))
+            .block(
+                Block::default()
+                    .title(panel_title("Prompt", theme))
+                    .borders(Borders::ALL),
+            )
+            .style(style)
+            .scroll((app.detail_scroll, 0)),
+            body_chunks[1],
+        );
+    }
 }
 
 fn draw_settings_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -3086,6 +3207,7 @@ fn footer_actions(app: &App) -> Vec<FooterAction> {
             ],
             Screen::TaskDetail => vec![
                 footer_action("Up/Down", "scroll"),
+                footer_action("p", "copy prompt"),
                 footer_action("c", "chat"),
                 footer_action("e", "edit"),
                 footer_action("d", "delete"),
@@ -3099,8 +3221,16 @@ fn footer_actions(app: &App) -> Vec<FooterAction> {
             ],
         },
         Mode::Chat(ref form) if form.pending => vec![footer_action("Esc", "cancel")],
-        Mode::Chat(_) => vec![
+        Mode::Chat(ref form) => vec![
             footer_action("Enter", "create draft"),
+            footer_action(
+                "Tab",
+                if form.include_agent_prompt {
+                    "prompt on"
+                } else {
+                    "prompt off"
+                },
+            ),
             footer_action("Esc", "cancel"),
         ],
         Mode::Editing(_) => vec![
@@ -3161,16 +3291,20 @@ fn draw_edit_modal(
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
+    let constraints = form
+        .fields
+        .iter()
+        .map(|field| {
+            if field.multiline {
+                Constraint::Min(4)
+            } else {
+                Constraint::Length(3)
+            }
+        })
+        .collect::<Vec<_>>();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
+        .constraints(constraints)
         .split(inner);
 
     let mut cursor_position = None;
@@ -3248,9 +3382,11 @@ fn draw_chat_bar(
         Style::default().fg(theme.accent)
     };
     let title = if form.pending {
-        "New Todo: waiting"
+        "New Todo: waiting".to_string()
+    } else if form.include_agent_prompt {
+        "New Todo: prompt on".to_string()
     } else {
-        "New Todo"
+        "New Todo: prompt off".to_string()
     };
     let block = Block::default()
         .title(panel_title(title, theme))
@@ -3362,18 +3498,31 @@ fn task_preview_lines(task: &Task, theme: UiTheme) -> Vec<Line<'static>> {
             footer_key_style(theme),
         )]),
         property_line("Labels", format_labels(&task.labels), theme),
-        property_line("Branch", task.branch.as_deref().unwrap_or("-"), theme),
         property_line(
-            "Completed",
-            task.completed_at.as_deref().unwrap_or("-"),
+            "Branch",
+            task.branch.as_deref().unwrap_or(EMPTY_VALUE),
             theme,
         ),
-        property_line("Due", task.due_at.as_deref().unwrap_or("-"), theme),
+        property_line(
+            "Completed",
+            task.completed_at.as_deref().unwrap_or(EMPTY_VALUE),
+            theme,
+        ),
+        property_line("Due", task.due_at.as_deref().unwrap_or(EMPTY_VALUE), theme),
         Line::from(""),
     ];
 
     lines.push(property_label_line("Content", theme));
     lines.push(Line::from(content_excerpt(&task.content, 540)));
+    if let Some(prompt) = task
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        lines.push(Line::from(""));
+        lines.push(property_label_line("Prompt", theme));
+        lines.push(Line::from(content_excerpt(prompt, 300)));
+    }
 
     if task_is_hidden(task, &now) {
         lines.push(Line::from(""));
@@ -3404,17 +3553,23 @@ fn task_metadata_lines(task: &Task) -> Vec<Line<'static>> {
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from(format!("Labels: {}", format_labels(&task.labels))),
-        Line::from(format!("Branch: {}", task.branch.as_deref().unwrap_or("-"))),
+        Line::from(format!(
+            "Branch: {}",
+            task.branch.as_deref().unwrap_or(EMPTY_VALUE)
+        )),
         Line::from(format!("Created: {}", task.created_at)),
         Line::from(format!(
             "Updated: {}",
-            task.updated_at.as_deref().unwrap_or("-")
+            task.updated_at.as_deref().unwrap_or(EMPTY_VALUE)
         )),
         Line::from(format!(
             "Completed: {}",
-            task.completed_at.as_deref().unwrap_or("-")
+            task.completed_at.as_deref().unwrap_or(EMPTY_VALUE)
         )),
-        Line::from(format!("Due: {}", task.due_at.as_deref().unwrap_or("-"))),
+        Line::from(format!(
+            "Due: {}",
+            task.due_at.as_deref().unwrap_or(EMPTY_VALUE)
+        )),
     ]
 }
 
@@ -3430,7 +3585,7 @@ fn content_excerpt(content: &str, max_chars: usize) -> String {
         .replace(['_', '`'], "");
 
     if cleaned.is_empty() {
-        return "-".to_string();
+        return EMPTY_VALUE.to_string();
     }
 
     let char_count = cleaned.chars().count();
@@ -3444,7 +3599,7 @@ fn content_excerpt(content: &str, max_chars: usize) -> String {
 
 fn format_labels(labels: &[String]) -> String {
     if labels.is_empty() {
-        "-".to_string()
+        EMPTY_VALUE.to_string()
     } else {
         labels.join(", ")
     }
@@ -3974,6 +4129,7 @@ mod tests {
                 id: "0197f27f-83b0-7000-8000-000000000001".to_string(),
                 title: "Do the thing".to_string(),
                 content: "Content with **bold**, _italic_, and `code`.".to_string(),
+                prompt: None,
                 labels: vec!["task".to_string()],
                 branch: None,
                 created_at: "2026-06-25T10:10:06+02:00".to_string(),
@@ -4007,6 +4163,7 @@ mod tests {
             instructions: "Write useful todos.".to_string(),
             project: sample_project(),
             user_prompt: "Customer asked for follow-up during the call.".to_string(),
+            include_agent_prompt: false,
             requested_at: "2026-06-25T10:00:00Z".to_string(),
             codex_reasoning_effort: None,
             codex_fast_mode: false,
@@ -4123,6 +4280,15 @@ mod tests {
         let projects = load_projects(dir.path())?;
 
         assert_eq!(projects[0].project.tasks[0].branch, None);
+        assert_eq!(projects[0].project.tasks[0].prompt, None);
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_missing_prompt_as_null() -> Result<()> {
+        let value = serde_json::to_value(sample_project())?;
+
+        assert_eq!(value.pointer("/tasks/0/prompt"), Some(&Value::Null));
         Ok(())
     }
 
@@ -4249,10 +4415,37 @@ mod tests {
         assert!(prompt.contains("chat bar JSON harness"));
         assert!(prompt.contains("Return only one valid JSON object."));
         assert!(prompt.contains("Do not include Markdown"));
+        assert!(prompt.contains(r#"return "prompt": null"#));
         assert!(prompt.contains("Write useful todos."));
         assert!(prompt.contains("Selected project:"));
         assert!(prompt.contains("Title: Example"));
         assert!(prompt.contains("Customer asked for follow-up"));
+    }
+
+    #[test]
+    fn chat_bar_todo_prompt_can_request_agent_prompt() {
+        let mut request = sample_llm_request();
+        request.include_agent_prompt = true;
+
+        let prompt = chat_bar_todo_prompt(&request);
+
+        assert!(prompt.contains(r#"return a non-empty "prompt" string"#));
+    }
+
+    #[test]
+    fn chat_form_tab_toggles_agent_prompt_mode() {
+        let mut form = ChatForm::new();
+
+        assert!(!form.include_agent_prompt);
+        assert_eq!(
+            form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ChatAction::None
+        );
+        assert!(form.include_agent_prompt);
+        assert_eq!(
+            form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ChatAction::Submit(String::new(), true)
+        );
     }
 
     #[test]
@@ -4302,6 +4495,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&Value::from("title"))
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from("prompt"))
         );
         Ok(())
     }
@@ -4407,6 +4606,16 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_sequence_uses_osc52() -> Result<()> {
+        let mut output = Vec::new();
+
+        write_clipboard_sequence(&mut output, "hello")?;
+
+        assert_eq!(String::from_utf8(output)?, "\x1b]52;c;aGVsbG8=\x07");
+        Ok(())
+    }
+
+    #[test]
     fn footer_styles_status_and_keybind_keys() -> Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("project.json");
@@ -4425,6 +4634,33 @@ mod tests {
                 && span.style.fg == Some(theme.accent)
                 && span.style.bg.is_none()
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn task_detail_footer_exposes_copy_prompt() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("project.json");
+        fs::write(&path, serde_json::to_string_pretty(&sample_project())?)?;
+
+        let mut app = test_app(dir.path())?;
+        app.screen = Screen::TaskDetail;
+
+        assert!(footer_actions(&app).contains(&footer_action("p", "copy prompt")));
+        Ok(())
+    }
+
+    #[test]
+    fn p_reports_empty_prompt_in_task_detail() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("project.json");
+        fs::write(&path, serde_json::to_string_pretty(&sample_project())?)?;
+
+        let mut app = test_app(dir.path())?;
+        app.screen = Screen::TaskDetail;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert_eq!(app.status_message_text(), Some("empty prompt"));
         Ok(())
     }
 
@@ -4465,7 +4701,7 @@ mod tests {
         let response = serde_json::json!({
             "choices": [{
                 "message": {
-                    "content": r#"{"title":"Call customer","content":"Ask for the missing invoice number.","labels":["call","billing"],"branch":null,"due_at":null}"#
+                    "content": r#"{"title":"Call customer","content":"Ask for the missing invoice number.","prompt":null,"labels":["call","billing"],"branch":null,"due_at":null}"#
                 }
             }]
         });
@@ -4473,6 +4709,7 @@ mod tests {
         let draft = parse_chat_completion_draft(&response)?;
 
         assert_eq!(draft.title, "Call customer");
+        assert_eq!(draft.prompt, None);
         assert_eq!(draft.labels, vec!["call", "billing"]);
         assert_eq!(draft.branch, None);
         Ok(())
@@ -4481,13 +4718,14 @@ mod tests {
     #[test]
     fn parses_direct_todo_draft_json_and_rejects_fenced_output() -> Result<()> {
         let direct = parse_todo_draft_json(
-            r#"{"title":"Direct","content":"Plain final message.","labels":[],"branch":null,"due_at":null}"#,
+            r#"{"title":"Direct","content":"Plain final message.","prompt":"Run the check.","labels":[],"branch":null,"due_at":null}"#,
         )?;
         let fenced = parse_todo_draft_json(
-            "```json\n{\"title\":\"Fenced\",\"content\":\"Fenced final message.\",\"labels\":[],\"branch\":null,\"due_at\":null}\n```",
+            "```json\n{\"title\":\"Fenced\",\"content\":\"Fenced final message.\",\"prompt\":null,\"labels\":[],\"branch\":null,\"due_at\":null}\n```",
         );
 
         assert_eq!(direct.title, "Direct");
+        assert_eq!(direct.prompt.as_deref(), Some("Run the check."));
         assert!(fenced.is_err());
         Ok(())
     }
@@ -4495,7 +4733,7 @@ mod tests {
     #[test]
     fn parses_codex_jsonl_final_agent_message() -> Result<()> {
         let stdout = r#"{"type":"thread.started","thread_id":"1"}
-{"type":"item.completed","item":{"type":"agent_message","text":"{\"title\":\"Codex\",\"content\":\"JSONL final message.\",\"labels\":[],\"branch\":null,\"due_at\":null}"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"title\":\"Codex\",\"content\":\"JSONL final message.\",\"prompt\":null,\"labels\":[],\"branch\":null,\"due_at\":null}"}}
 {"type":"turn.completed"}"#;
 
         let draft = parse_codex_json_final_message(stdout)?;
@@ -4524,7 +4762,7 @@ mod tests {
     #[test]
     fn rejects_todo_draft_json_with_extra_fields() {
         let error = parse_todo_draft_json(
-            r#"{"id":"nope","title":"Direct","content":"Plain final message.","labels":[],"branch":null,"due_at":null}"#,
+            r#"{"id":"nope","title":"Direct","content":"Plain final message.","prompt":null,"labels":[],"branch":null,"due_at":null}"#,
         )
         .unwrap_err()
         .to_string();
@@ -4533,21 +4771,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_todo_draft_json_without_prompt_key() {
+        let error = parse_todo_draft_json(
+            r#"{"title":"Direct","content":"Plain final message.","labels":[],"branch":null,"due_at":null}"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("missing prompt"));
+    }
+
+    #[test]
     fn converts_llm_draft_to_new_task_with_app_owned_fields() -> Result<()> {
         let task = llm_draft_to_task(
             LlmTodoDraft {
                 title: "  Follow up ".to_string(),
                 content: " Capture the decision. ".to_string(),
+                prompt: Some(" Use the call notes. ".to_string()),
                 labels: vec![" meeting ".to_string(), "".to_string()],
                 branch: Some(" ".to_string()),
                 due_at: Some("2026-06-26T09:00:00+02:00".to_string()),
             },
             DateTime::parse_from_rfc3339("2026-06-25T10:00:00+02:00")?.with_timezone(&Utc),
+            true,
         )?;
 
         assert_eq!(Uuid::parse_str(&task.id)?.get_version_num(), 7);
         assert_eq!(task.title, "Follow up");
         assert_eq!(task.content, "Capture the decision.");
+        assert_eq!(task.prompt.as_deref(), Some("Use the call notes."));
         assert_eq!(task.labels, vec!["meeting"]);
         assert_eq!(task.branch, None);
         assert_eq!(task.created_at, "2026-06-25T08:00:00Z");
@@ -4555,6 +4807,26 @@ mod tests {
         assert_eq!(task.completed_at, None);
         assert_eq!(task.due_at.as_deref(), Some("2026-06-26T09:00:00+02:00"));
         Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_agent_prompt_when_requested() {
+        let error = llm_draft_to_task(
+            LlmTodoDraft {
+                title: "Follow up".to_string(),
+                content: "Capture the decision.".to_string(),
+                prompt: Some(" ".to_string()),
+                labels: Vec::new(),
+                branch: None,
+                due_at: None,
+            },
+            Utc::now(),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("draft prompt cannot be empty"));
     }
 
     #[test]
@@ -4699,6 +4971,21 @@ mod tests {
     }
 
     #[test]
+    fn task_preview_includes_prompt_excerpt_when_present() {
+        let mut task = task_with_id("0197f27f-83b0-7000-8000-000000000002");
+        task.prompt = Some("Run `cargo test` and summarize failures.".to_string());
+
+        let preview = task_preview_lines(&task, test_ui_theme());
+
+        assert!(preview.iter().any(|line| line_text(line) == "Prompt:"));
+        assert!(
+            preview
+                .iter()
+                .any(|line| line_text(line) == "Run cargo test and summarize failures.")
+        );
+    }
+
+    #[test]
     fn old_completed_tasks_are_hidden_until_toggled() -> Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("project.json");
@@ -4787,16 +5074,22 @@ mod tests {
         let task = sample_project().tasks.remove(0);
         let mut form = EditForm::from_task(&task);
 
-        assert_eq!(form.fields.len(), 6);
+        assert_eq!(form.fields.len(), 7);
         assert!(!form.fields.iter().any(|field| field.label == "Created at"));
+        assert!(form.fields.iter().any(|field| field.label == "Prompt"));
 
         form.fields[0].value = "New title".to_string();
-        form.fields[2].value = "one, two, , three".to_string();
-        form.fields[3].value = "feature/example".to_string();
-        form.fields[4].value = "2026-06-25T12:00:00+02:00".to_string();
+        form.fields[2].value = "Use the local test command.".to_string();
+        form.fields[3].value = "one, two, , three".to_string();
+        form.fields[4].value = "feature/example".to_string();
+        form.fields[5].value = "2026-06-25T12:00:00+02:00".to_string();
         let update = form.to_update()?;
 
         assert_eq!(update.title, "New title");
+        assert_eq!(
+            update.prompt.as_deref(),
+            Some("Use the local test command.")
+        );
         assert_eq!(update.labels, vec!["one", "two", "three"]);
         assert_eq!(update.branch.as_deref(), Some("feature/example"));
         assert_eq!(
@@ -4804,10 +5097,10 @@ mod tests {
             Some("2026-06-25T12:00:00+02:00")
         );
 
-        form.fields[3].value = "   ".to_string();
+        form.fields[4].value = "   ".to_string();
         assert_eq!(form.to_update()?.branch, None);
 
-        form.fields[5].value = "not a date".to_string();
+        form.fields[6].value = "not a date".to_string();
         let error = form.to_update().unwrap_err().to_string();
         assert!(error.contains("due_at must be an RFC3339 datetime"));
         Ok(())
@@ -4935,7 +5228,8 @@ mod tests {
         app.mode = Mode::Editing(EditForm::from_task(&app.current_task().unwrap().clone()));
         if let Mode::Editing(form) = &mut app.mode {
             form.fields[0].value = "Updated title".to_string();
-            form.fields[3].value = "feature/example".to_string();
+            form.fields[2].value = "Run the focused test.".to_string();
+            form.fields[4].value = "feature/example".to_string();
         }
 
         app.save_edit_form()?;
@@ -4943,6 +5237,7 @@ mod tests {
         let saved = load_projects(dir.path())?;
         let task = &saved[0].project.tasks[0];
         assert_eq!(task.title, "Updated title");
+        assert_eq!(task.prompt.as_deref(), Some("Run the focused test."));
         assert_eq!(task.branch.as_deref(), Some("feature/example"));
         assert_eq!(task.created_at, "2026-06-25T10:10:06+02:00");
         assert!(task.updated_at.is_some());
@@ -4960,11 +5255,13 @@ mod tests {
             LlmTodoDraft {
                 title: "Draft title".to_string(),
                 content: "Draft content".to_string(),
+                prompt: Some("Agent-only notes".to_string()),
                 labels: vec!["llm".to_string()],
                 branch: None,
                 due_at: None,
             },
             Utc::now(),
+            false,
         )?;
 
         app.open_llm_draft(task);
@@ -4978,6 +5275,7 @@ mod tests {
         assert_eq!(saved[0].project.tasks.len(), 2);
         assert_eq!(task.title, "Reviewed title");
         assert_eq!(task.content, "Draft content");
+        assert_eq!(task.prompt, None);
         assert_eq!(task.labels, vec!["llm"]);
         assert!(task.updated_at.is_none());
         assert_eq!(app.screen, Screen::ProjectDetail);

@@ -4,6 +4,7 @@
   "required": [
     "title",
     "content",
+    "prompt",
     "labels",
     "branch",
     "due_at"
@@ -17,6 +18,12 @@
     "content": {
       "type": "string",
       "minLength": 1
+    },
+    "prompt": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "labels": {
       "type": "array",

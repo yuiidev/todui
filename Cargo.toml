@@ -1,10 +1,11 @@
 [package]
 name = "todui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.28"
 notify = "7"
