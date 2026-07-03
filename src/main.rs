@@ -310,6 +310,12 @@ fn load_projects(data_dir: &Path) -> Result<Vec<ProjectFile>> {
         projects.push(load_project_file(&path)?);
     }
 
+    sort_project_files(&mut projects);
+
+    Ok(projects)
+}
+
+fn sort_project_files(projects: &mut [ProjectFile]) {
     projects.sort_by(|left, right| {
         left.project
             .title
@@ -317,8 +323,6 @@ fn load_projects(data_dir: &Path) -> Result<Vec<ProjectFile>> {
             .cmp(&right.project.title.to_lowercase())
             .then_with(|| left.file_stem.cmp(&right.file_stem))
     });
-
-    Ok(projects)
 }
 
 fn save_project(project_file: &ProjectFile) -> Result<()> {
@@ -326,6 +330,54 @@ fn save_project(project_file: &ProjectFile) -> Result<()> {
         .with_context(|| format!("serialize project {}", project_file.project.title))?;
     fs::write(&project_file.path, format!("{json}\n"))
         .with_context(|| format!("write project file {}", project_file.path.display()))
+}
+
+fn project_file_stem(title: &str) -> String {
+    let mut stem = String::new();
+    let mut last_was_dash = false;
+
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            stem.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !stem.is_empty() {
+            stem.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let stem = stem.trim_matches('-');
+    if stem.is_empty() {
+        "project".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+fn available_project_file(data_dir: &Path, title: &str) -> (String, PathBuf) {
+    let stem = project_file_stem(title);
+    for index in 0.. {
+        let candidate = if index == 0 {
+            stem.clone()
+        } else {
+            format!("{stem}-{}", index + 1)
+        };
+        let path = data_dir.join(format!("{candidate}.json"));
+        if !path.exists() {
+            return (candidate, path);
+        }
+    }
+
+    unreachable!()
+}
+
+fn new_project(title: String, description: String, labels: Vec<String>) -> Project {
+    Project {
+        title,
+        description,
+        labels,
+        tasks: Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1068,6 +1120,7 @@ impl App {
             KeyCode::Enter => self.open_selected(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('c') => self.open_chat_bar(),
+            KeyCode::Char('n') => self.start_creating_project(),
             KeyCode::Char(' ') => self.toggle_selected_task_completion(),
             KeyCode::Char('h') => self.toggle_hidden_tasks(),
             KeyCode::Char('e') => self.start_editing_selected_task(),
@@ -1471,6 +1524,13 @@ impl App {
         Ok(())
     }
 
+    fn start_creating_project(&mut self) -> Result<()> {
+        if self.screen == Screen::Projects {
+            self.mode = Mode::Editing(EditForm::from_new_project());
+        }
+        Ok(())
+    }
+
     fn start_delete_confirmation(&mut self) -> Result<()> {
         match self.screen {
             Screen::Projects => {
@@ -1491,10 +1551,41 @@ impl App {
     }
 
     fn save_edit_form(&mut self) -> Result<()> {
-        let (update, new_task) = match &self.mode {
-            Mode::Editing(form) => (form.to_update()?, form.new_task.clone()),
+        let (new_project, update, new_task) = match &self.mode {
+            Mode::Editing(form) => (
+                form.new_project.then(|| form.to_project()).transpose()?,
+                (!form.new_project).then(|| form.to_update()).transpose()?,
+                form.new_task.clone(),
+            ),
             _ => return Ok(()),
         };
+
+        if let Some(project) = new_project {
+            let (file_stem, path) = available_project_file(&self.data_dir, &project.title);
+            let project_file = ProjectFile {
+                file_stem,
+                path,
+                project,
+            };
+            save_project(&project_file)?;
+
+            let created_path = project_file.path.clone();
+            self.projects.push(project_file);
+            sort_project_files(&mut self.projects);
+            self.project_index = self
+                .projects
+                .iter()
+                .position(|project| project.path == created_path)
+                .unwrap_or(0);
+            self.task_index = 0;
+            self.detail_scroll = 0;
+            self.screen = Screen::ProjectDetail;
+            self.mode = Mode::Normal;
+            self.set_status_message("project added");
+            return Ok(());
+        }
+
+        let update = update.ok_or_else(|| anyhow!("no todo update"))?;
         let project_index = self.project_index;
         if let Some(mut task) = new_task {
             apply_task_update(&mut task, update, false);
@@ -1654,6 +1745,7 @@ struct EditForm {
     fields: Vec<EditableField>,
     active: usize,
     new_task: Option<Task>,
+    new_project: bool,
 }
 
 #[derive(Debug)]
@@ -1830,6 +1922,7 @@ fn codex_exec_args(request: &LlmTodoRequest) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
         "--ephemeral".to_string(),
+        "--skip-git-repo-check".to_string(),
         "-s".to_string(),
         "read-only".to_string(),
     ];
@@ -2001,6 +2094,7 @@ impl EditForm {
             ],
             active: 0,
             new_task: None,
+            new_project: false,
         }
     }
 
@@ -2008,6 +2102,29 @@ impl EditForm {
         let mut form = Self::from_task(task);
         form.new_task = Some(task.clone());
         form
+    }
+
+    fn from_new_project() -> Self {
+        Self {
+            fields: vec![
+                EditableField::single_line("Title", String::new()),
+                EditableField::multi_line("Description", String::new()),
+                EditableField::single_line("Labels", String::new()),
+            ],
+            active: 0,
+            new_task: None,
+            new_project: true,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        if self.new_project {
+            "New Project"
+        } else if self.new_task.is_some() {
+            "New Todo"
+        } else {
+            "Edit Todo"
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EditAction {
@@ -2096,6 +2213,19 @@ impl EditForm {
             completed_at: parse_nullable_datetime(&self.fields[4].value, "completed_at")?,
             due_at: parse_nullable_datetime(&self.fields[5].value, "due_at")?,
         })
+    }
+
+    fn to_project(&self) -> Result<Project> {
+        let title = self.fields[0].value.trim().to_string();
+        if title.is_empty() {
+            bail!("title cannot be empty");
+        }
+
+        Ok(new_project(
+            title,
+            self.fields[1].value.trim().to_string(),
+            parse_labels(&self.fields[2].value),
+        ))
     }
 }
 
@@ -2566,8 +2696,10 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     if let Mode::Editing(form) = &mut app.mode {
+        let title = form.title();
         draw_edit_modal(
             frame,
+            title,
             status_message.as_deref(),
             form,
             app.syntax_resources.ui_theme,
@@ -2603,7 +2735,7 @@ fn draw_projects_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let items = if app.projects.is_empty() {
-        vec![ListItem::new("No projects in data/")]
+        vec![ListItem::new("No projects")]
     } else {
         app.projects
             .iter()
@@ -2636,7 +2768,7 @@ fn draw_projects_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let preview = app
         .current_project()
         .map(|project| project_preview_lines(project, theme))
-        .unwrap_or_else(|| vec![Line::from("Create a project JSON file in data/ to begin.")]);
+        .unwrap_or_else(|| vec![Line::from("No project selected")]);
     frame.render_widget(
         Paragraph::new(preview)
             .block(
@@ -2928,6 +3060,7 @@ fn footer_actions(app: &App) -> Vec<FooterAction> {
             Screen::Projects => vec![
                 footer_action("Up/Down", "move"),
                 footer_action("Enter", "open"),
+                footer_action("n", "new"),
                 footer_action("c", "chat"),
                 footer_action("s", "settings"),
                 footer_action("d", "delete"),
@@ -3011,6 +3144,7 @@ fn panel_title(title: impl Into<String>, theme: UiTheme) -> Line<'static> {
 
 fn draw_edit_modal(
     frame: &mut Frame<'_>,
+    title: &str,
     status_message: Option<&str>,
     form: &mut EditForm,
     theme: UiTheme,
@@ -3021,7 +3155,7 @@ fn draw_edit_modal(
 
     let style = theme.style(use_theme_background);
     let outer = Block::default()
-        .title(panel_title("Edit Todo", theme))
+        .title(panel_title(title, theme))
         .borders(Borders::ALL)
         .style(style);
     let inner = outer.inner(area);
@@ -4127,6 +4261,7 @@ mod tests {
 
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--ephemeral".to_string()));
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
         assert!(
             args.windows(2)
                 .any(|pair| pair[0] == "-s" && pair[1] == "read-only")
@@ -4847,6 +4982,46 @@ mod tests {
         assert!(task.updated_at.is_none());
         assert_eq!(app.screen, Screen::ProjectDetail);
         assert_eq!(app.task_index, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn project_file_stems_are_slugged_and_unique() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("client-portal.json"), "{}")?;
+
+        let (stem, path) = available_project_file(dir.path(), "Client Portal!");
+        let (fallback, _) = available_project_file(dir.path(), "...");
+
+        assert_eq!(stem, "client-portal-2");
+        assert_eq!(path, dir.path().join("client-portal-2.json"));
+        assert_eq!(fallback, "project");
+        Ok(())
+    }
+
+    #[test]
+    fn saving_new_project_creates_json_and_selects_it() -> Result<()> {
+        let dir = tempdir()?;
+        let mut app = test_app(dir.path())?;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        if let Mode::Editing(form) = &mut app.mode {
+            form.fields[0].value = "Client Portal".to_string();
+            form.fields[1].value = "Track client portal work.".to_string();
+            form.fields[2].value = "client, portal".to_string();
+        }
+        app.save_edit_form()?;
+
+        let path = dir.path().join("client-portal.json");
+        let saved = load_project_file(&path)?;
+
+        assert!(path.exists());
+        assert_eq!(saved.project.title, "Client Portal");
+        assert_eq!(saved.project.description, "Track client portal work.");
+        assert_eq!(saved.project.labels, vec!["client", "portal"]);
+        assert!(saved.project.tasks.is_empty());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+        assert_eq!(app.current_project().unwrap().path, path);
         Ok(())
     }
 
